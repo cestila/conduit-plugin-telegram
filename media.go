@@ -262,18 +262,20 @@ func describeIncomingPhoto(msgID int, media *tg.MessageMediaPhoto) (incomingMedi
 	}
 
 	name := fmt.Sprintf("photo_%d.jpg", msgID)
-	return incomingMedia{
+	info := incomingMedia{
 		fileName:    name,
 		storageName: name,
 		mimeType:    "image/jpeg",
 		contentType: "image",
 		size:        int64(size),
-	}, &tg.InputPhotoFileLocation{
+	}
+	location := &tg.InputPhotoFileLocation{
 		ID:            photo.ID,
 		AccessHash:    photo.AccessHash,
 		FileReference: photo.FileReference,
 		ThumbSize:     sizeType,
 	}
+	return info, location
 }
 
 // largestPhotoSize devuelve el tipo de la variante con más píxeles y su tamaño.
@@ -335,17 +337,19 @@ func describeIncomingDocument(msgID int, media *tg.MessageMediaDocument) (incomi
 		contentType = "audio"
 	}
 
-	return incomingMedia{
+	info := incomingMedia{
 		fileName:    name,
 		storageName: storageFileName(msgID, name),
 		mimeType:    mimeType,
 		contentType: contentType,
 		size:        doc.Size,
-	}, &tg.InputDocumentFileLocation{
+	}
+	location := &tg.InputDocumentFileLocation{
 		ID:            doc.ID,
 		AccessHash:    doc.AccessHash,
 		FileReference: doc.FileReference,
 	}
+	return info, location
 }
 
 // documentDetails extrae el nombre visible y si el audio es una nota de voz.
