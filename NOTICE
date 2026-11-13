@@ -1,0 +1,19 @@
+conduit-plugin-telegram
+Copyright 2026 Carlos Estilarte
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party software
+--------------------
+Notable dependencies, each under its own license:
+
+  github.com/gotd/td               MIT           (Telegram MTProto client)
+  github.com/hashicorp/go-plugin   MPL-2.0       (plugin transport)
+  google.golang.org/grpc           Apache-2.0    (RPC)
+
+The Mozilla Public License 2.0 is a file-level copyleft license. The MPL-2.0
+files of the dependencies listed above are used here unmodified, and their
+source is available from the upstream projects.
+
+See go.mod and go.sum for the full list of dependencies; each keeps its own
+license and copyright notices.

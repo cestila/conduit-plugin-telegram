@@ -1,0 +1,49 @@
+version: 2
+
+project_name: conduit-plugin-telegram
+
+builds:
+  - id: conduit-plugin-telegram
+    main: .
+    binary: conduit-plugin-telegram
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: default
+    ids: [conduit-plugin-telegram]
+    # Installer contract: conduit-plugin-<version>_<goos>_<goarch>.tar.gz
+    # (.zip on windows) with the binary at the archive root.
+    name_template: "conduit-plugin-telegram_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    wrap_in_directory: false
+    files:
+      # Globs: a missing file is skipped instead of failing the build.
+      - src: "LICENSE*"
+      - src: "NOTICE*"
+      - src: "README*"
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  github:
+    owner: cestila
+    name: conduit-plugin-telegram
