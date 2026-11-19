@@ -9,6 +9,8 @@ Every pull request with a user-visible change adds an entry under
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-19
+
 ### Added
 
 - Publish `plugin-metadata.json` as a GoReleaser release asset so `conduitd` can read plugin compatibility metadata directly from this repository's releases.
@@ -52,7 +54,8 @@ Tagged, but the release build failed and no binaries were published. Use
 - Plugin manifest (`GetManifest`) so the desktop app renders the account form
   and QR instructions.
 
-[Unreleased]: https://github.com/cestila/conduit-plugin-telegram/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/cestila/conduit-plugin-telegram/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/cestila/conduit-plugin-telegram/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/cestila/conduit-plugin-telegram/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/cestila/conduit-plugin-telegram/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/cestila/conduit-plugin-telegram/compare/v0.1.0...v0.1.1
