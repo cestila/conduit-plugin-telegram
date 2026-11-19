@@ -9,6 +9,13 @@ Every pull request with a user-visible change adds an entry under
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-19
+
+### Added
+
+- `channel.disconnected` event emission when the MTProto client session terminates unexpectedly.
+- Updated `github.com/cestila/ConduitOmniChat/sdk` to `v0.2.0`.
+
 ## [0.1.1] - 2026-11-13
 
 First release with published binaries. Requires a `conduitd` that speaks

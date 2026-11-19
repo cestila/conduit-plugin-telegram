@@ -151,6 +151,12 @@ func (p *TelegramPlugin) run(ctx context.Context) {
 	if err != nil && ctx.Err() == nil {
 		log.Printf("❌ sesión de Telegram terminada: %v", err)
 		p.emitAuthError(err)
+		p.eventCh <- &conduitv1.PluginEvent{
+			EventType:      "channel.disconnected",
+			RemoteSenderId: "telegram-system",
+			Body:           err.Error(),
+			SentAtUnix:     time.Now().Unix(),
+		}
 	}
 }
 
