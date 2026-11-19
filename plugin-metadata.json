@@ -1,0 +1,6 @@
+{
+  "min_protocol_version": 1,
+  "max_protocol_version": 1,
+  "min_core_version": "0.1.0",
+  "dependencies": []
+}

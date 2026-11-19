@@ -9,6 +9,10 @@ Every pull request with a user-visible change adds an entry under
 
 ## [Unreleased]
 
+### Added
+
+- Publish `plugin-metadata.json` as a GoReleaser release asset so `conduitd` can read plugin compatibility metadata directly from this repository's releases.
+
 ## [0.1.3] - 2026-11-19
 
 ### Added

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -33,5 +35,31 @@ func TestGetManifestDescribesPlugin(t *testing.T) {
 	}
 	if got := strings.Join(keys, ","); got != "api_id,api_hash,password" {
 		t.Fatalf("credential field keys = %q, want %q", got, "api_id,api_hash,password")
+	}
+}
+
+func TestPluginMetadataMatchesSDKProtocol(t *testing.T) {
+	data, err := os.ReadFile("plugin-metadata.json")
+	if err != nil {
+		t.Fatalf("reading plugin-metadata.json: %v", err)
+	}
+	var meta struct {
+		MinProtocolVersion uint32 `json:"min_protocol_version"`
+		MaxProtocolVersion uint32 `json:"max_protocol_version"`
+		MinCoreVersion     string `json:"min_core_version"`
+		Dependencies       []any  `json:"dependencies"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("decoding plugin-metadata.json: %v", err)
+	}
+	if meta.MinProtocolVersion == 0 {
+		t.Fatal("min_protocol_version must be > 0")
+	}
+	if meta.MinProtocolVersion > pluginsdk.ProtocolVersion || meta.MaxProtocolVersion < pluginsdk.ProtocolVersion {
+		t.Fatalf("protocol bounds [%d, %d] do not cover sdk ProtocolVersion %d",
+			meta.MinProtocolVersion, meta.MaxProtocolVersion, pluginsdk.ProtocolVersion)
+	}
+	if strings.TrimSpace(meta.MinCoreVersion) == "" {
+		t.Fatal("min_core_version must not be empty")
 	}
 }
