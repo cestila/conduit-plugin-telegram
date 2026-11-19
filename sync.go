@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +36,8 @@ type peerInfo struct {
 	channelType string
 	peer        tg.InputPeerClass
 	topicID     int
+	isBot       bool
+	isSelf      bool
 }
 
 // rememberPeer registra un chat para poder enviarle mensajes después.
@@ -200,6 +203,24 @@ func (p *TelegramPlugin) publishUnreadDialogs(dialogs []tg.DialogClass, messages
 
 // applyUsers publica los contactos humanos de la cuenta.
 func (p *TelegramPlugin) applyUsers(users []tg.UserClass) {
+	for _, info := range p.cacheUsers(users) {
+		p.emit(&conduitv1.PluginEvent{
+			EventType:       "contact.sync",
+			RemoteSenderId:  info.remoteID,
+			SenderName:      info.title,
+			Body:            info.username,
+			SentAtUnix:      nowUnix(),
+			ContentType:     "text",
+			RemoteMessageId: "contact-" + info.remoteID,
+			IdentityPhone:   info.phone,
+		})
+	}
+}
+
+// cacheUsers filters out self, deleted, and bot accounts, caches human 1:1 users,
+// and returns the cached peer entries.
+func (p *TelegramPlugin) cacheUsers(users []tg.UserClass) []*peerInfo {
+	cached := make([]*peerInfo, 0, len(users))
 	for _, uc := range users {
 		user, ok := uc.(*tg.User)
 		if !ok || user == nil || user.Self || user.Deleted || user.Bot {
@@ -215,7 +236,7 @@ func (p *TelegramPlugin) applyUsers(users []tg.UserClass) {
 			displayName = remoteID
 		}
 
-		p.rememberPeer(&peerInfo{
+		info := &peerInfo{
 			remoteID: remoteID,
 			kind:     kindUser,
 			id:       user.ID,
@@ -223,19 +244,61 @@ func (p *TelegramPlugin) applyUsers(users []tg.UserClass) {
 			username: user.Username,
 			phone:    user.Phone,
 			peer:     &tg.InputPeerUser{UserID: user.ID, AccessHash: user.AccessHash},
-		})
+		}
+		p.rememberPeer(info)
+		cached = append(cached, info)
+	}
+	return cached
+}
 
-		p.emit(&conduitv1.PluginEvent{
-			EventType:       "contact.sync",
-			RemoteSenderId:  remoteID,
-			SenderName:      displayName,
-			Body:            user.Username,
-			SentAtUnix:      nowUnix(),
-			ContentType:     "text",
-			RemoteMessageId: "contact-" + remoteID,
-			IdentityPhone:   user.Phone,
+// cachedUserContacts returns all cached 1:1 human user peers as PluginContacts.
+func (p *TelegramPlugin) cachedUserContacts(accountID string) []*conduitv1.PluginContact {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	contacts := make([]*conduitv1.PluginContact, 0, len(p.peers))
+	for _, info := range p.peers {
+		if info == nil || info.kind != kindUser || info.topicID != 0 || info.isBot || info.isSelf {
+			continue
+		}
+		contacts = append(contacts, &conduitv1.PluginContact{
+			AccountId:   accountID,
+			RemoteId:    info.remoteID,
+			DisplayName: info.title,
+			Phone:       info.phone,
+			Handle:      info.username,
 		})
 	}
+	sort.Slice(contacts, func(i, j int) bool {
+		return contacts[i].RemoteId < contacts[j].RemoteId
+	})
+	return contacts
+}
+
+// SyncContacts fetches contacts via MTProto (when connected) and returns all
+// cached 1:1 human user contacts, excluding bots, channels, and groups.
+func (p *TelegramPlugin) SyncContacts(ctx context.Context, req *conduitv1.SyncContactsRequest) (*conduitv1.PluginSyncContactsResponse, error) {
+	p.mu.RLock()
+	client := p.client
+	connected := p.connected
+	accountID := req.GetAccountId()
+	p.mu.RUnlock()
+
+	if client != nil && connected {
+		res, err := client.API().ContactsGetContacts(ctx, 0)
+		if err != nil {
+			return &conduitv1.PluginSyncContactsResponse{
+				Error: fmt.Sprintf("contacts.getContacts failed: %v", err),
+			}, nil
+		}
+		if contacts, ok := res.(*tg.ContactsContacts); ok {
+			p.cacheUsers(contacts.Users)
+		}
+	}
+
+	return &conduitv1.PluginSyncContactsResponse{
+		Contacts: p.cachedUserContacts(accountID),
+	}, nil
 }
 
 // applyChats publica grupos y canales respetando la jerarquía del servidor.
@@ -428,6 +491,8 @@ func (p *TelegramPlugin) rememberEntities(e *tg.Entities) {
 			username: user.Username,
 			phone:    user.Phone,
 			peer:     &tg.InputPeerUser{UserID: user.ID, AccessHash: user.AccessHash},
+			isBot:    user.Bot,
+			isSelf:   user.Self,
 		})
 	}
 	for _, channel := range e.Channels {

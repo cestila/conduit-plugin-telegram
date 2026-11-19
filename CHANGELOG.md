@@ -9,6 +9,10 @@ Every pull request with a user-visible change adds an entry under
 
 ## [Unreleased]
 
+### Added
+
+- Implemented `SyncContacts` RPC to fetch contacts via MTProto when connected and return cached 1:1 human contacts (excluding bots, self, deleted users, groups, and channels), with unit tests.
+
 ## [0.1.2] - 2026-11-19
 
 ### Added
