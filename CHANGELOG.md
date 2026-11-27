@@ -9,6 +9,20 @@ Every pull request with a user-visible change adds an entry under
 
 ## [Unreleased]
 
+### Added
+
+- Continuous forum topic sync: topic pages are fully paginated (`messages.getForumTopics` with `offset_topic`/`offset_id`/`offset_date`, capped at 50 pages) and a complete list emits one `channel.reconcile` event per forum (`ServerId`, newline-separated live topic ids in `Body`, `SentAtUnix` = fetch start). An incomplete or failed list never emits it, because the core deletes what is missing irreversibly.
+- Forum re-syncs on `updateChannel`, on pinned-topic updates and on `MessageActionTopicCreate`/`MessageActionTopicEdit`, coalesced per forum with a 3 s debounce and never running twice at once for the same forum, plus a 5 minute safety sweep of every known forum while connected.
+- Deleted topics (`ForumTopicDeleted`, or absent from a complete list) forget their peer and are no longer synthesized, so catch-up stops fetching them; General is never forgotten.
+
+### Fixed
+
+- Forum topic titles are the real ones: the title comes from the topic itself, otherwise from the topic create/edit service message in the `messages.getForumTopics` response, otherwise from one bounded read of the topic's top message. A topic whose name is still unknown is never published as `Tema N` and no peer is registered for it, but it stays in the live `channel.reconcile` list so it is not deleted; as soon as the name is known the `channel.sync` is emitted with the real title and the existing conversation is renamed. Unchanged titles are not re-emitted on every sweep (only renames are).
+- Forum supergroups: a message whose topic cannot be resolved is routed to the General topic (`_topic_1`) instead of a channel named after the group, and unregistered topics are no longer named after the group or with a made-up `Tema N`.
+- The forum parent is no longer published as a `channel.sync` named after the group when topic sync fails or returns nothing; an empty topic list still publishes General.
+- `messages.getDialogs` is now paginated (offset date/id/peer, capped at 50 pages), so forums beyond the first 100 dialogs get their topics.
+- Messages in a topic whose name is still unknown are no longer published with an invented `Tema N` channel name nor register a peer with it: `ChannelName` stays empty until the real name is known.
+
 ## [0.1.4] - 2026-11-19
 
 ### Added

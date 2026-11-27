@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 
 	"github.com/gotd/td/tg"
@@ -49,7 +50,7 @@ func TestLookupPeerPlainChatUnaffected(t *testing.T) {
 	}
 }
 
-func TestMessageEventForumParentWithoutTopicStaysOnParent(t *testing.T) {
+func TestMessageEventForumWithoutTopicHeaderRoutesToGeneral(t *testing.T) {
 	p := NewTelegramPlugin()
 	p.rememberPeer(&peerInfo{
 		remoteID:    "-100555",
@@ -69,8 +70,59 @@ func TestMessageEventForumParentWithoutTopicStaysOnParent(t *testing.T) {
 	}
 
 	ev := p.messageEvent(msg, "-100555", kindChannel)
-	if ev == nil || ev.RemoteSenderId != "-100555" {
-		t.Fatalf("se esperaba RemoteSenderId=-100555, se obtuvo %q", ev.RemoteSenderId)
+	if ev == nil {
+		t.Fatal("se esperaba un evento de mensaje")
+	}
+	const general = "-100555_topic_1"
+	if ev.RemoteSenderId != general || ev.ChatJid != general {
+		t.Errorf("RemoteSenderId/ChatJid esperados %s, se obtuvo %q / %q", general, ev.RemoteSenderId, ev.ChatJid)
+	}
+	if ev.ChannelName != "General" {
+		t.Errorf("ChannelName esperado General, se obtuvo %q", ev.ChannelName)
+	}
+	if ev.ServerName != "Foro sin tema 1" || ev.ServerId != "-100555" || ev.ParentChannelId != "-100555" {
+		t.Errorf("jerarquía inválida: server=%q/%q parent=%q", ev.ServerId, ev.ServerName, ev.ParentChannelId)
+	}
+	if ev.ChannelType != "forum" {
+		t.Errorf("ChannelType esperado forum, se obtuvo %q", ev.ChannelType)
+	}
+	if !p.hasRegisteredPeer(general) {
+		t.Error("el tema General sintético debe quedar registrado")
+	}
+	if got := p.lookupPeer(general); got == nil || got.title != "General" {
+		t.Errorf("el peer General registrado debe titularse General, se obtuvo %+v", got)
+	}
+}
+
+func TestMessageEventForumUnregisteredTopicNeverNamedAfterGroup(t *testing.T) {
+	p := NewTelegramPlugin()
+	p.rememberPeer(&peerInfo{
+		remoteID:    "-100556",
+		kind:        kindChannel,
+		id:          556,
+		title:       "Nombre Grupo",
+		channelType: "forum",
+		peer:        &tg.InputPeerChannel{ChannelID: 556},
+	})
+
+	msg := &tg.Message{
+		ID:      301,
+		PeerID:  &tg.PeerChannel{ChannelID: 556},
+		FromID:  &tg.PeerUser{UserID: 888},
+		Date:    1_700_000_301,
+		Message: "En un tema aún no sincronizado",
+		ReplyTo: &tg.MessageReplyHeader{ForumTopic: true, ReplyToTopID: 9, ReplyToMsgID: 9},
+	}
+
+	ev := p.messageEvent(msg, "-100556", kindChannel)
+	if ev == nil || ev.RemoteSenderId != "-100556_topic_9" {
+		t.Fatalf("se esperaba enrutar al tema 9, se obtuvo %+v", ev)
+	}
+	if ev.ChannelName != "" {
+		t.Errorf("un tema sin nombre conocido no se publica con un nombre inventado, ChannelName=%q", ev.ChannelName)
+	}
+	if p.hasRegisteredPeer("-100556_topic_9") {
+		t.Error("no se registra un peer con un nombre falso")
 	}
 }
 
@@ -150,7 +202,7 @@ func TestApplyForumTopicsEmitsChannelSync(t *testing.T) {
 		},
 	}
 
-	p.applyForumTopics(serverRemoteID, serverTitle, parentPeer, topics)
+	p.applyForumTopics(context.Background(), nil, serverRemoteID, serverTitle, parentPeer, forumTopicList{topics: topics})
 
 	var events []*tgTopicEvent
 	for len(p.eventCh) > 0 {
@@ -208,7 +260,7 @@ func TestApplyForumTopicsGuaranteesGeneralTopic(t *testing.T) {
 		&tg.ForumTopic{ID: 43, Title: "Frontend React", Date: 1_700_001_000},
 	}
 
-	count := p.applyForumTopics(serverRemoteID, serverTitle, parentPeer, topics)
+	count := p.applyForumTopics(context.Background(), nil, serverRemoteID, serverTitle, parentPeer, forumTopicList{topics: topics})
 	if count != 3 {
 		t.Fatalf("se esperaban 3 temas (General inyectado + 2 temas), se obtuvieron %d", count)
 	}

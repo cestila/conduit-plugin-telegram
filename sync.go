@@ -65,6 +65,9 @@ func (p *TelegramPlugin) lookupPeer(remoteID string) *peerInfo {
 		return info
 	}
 	if chanRemoteID, topicID, isTopic := parseTopicRemoteID(remoteID); isTopic {
+		if _, deleted := p.deletedTopics[remoteID]; deleted {
+			return nil // un tema borrado no se sintetiza: ya no existe en el foro
+		}
 		var parent *peerInfo
 		if pChan, ok := p.peers[chanRemoteID]; ok {
 			parent = pChan
@@ -114,6 +117,13 @@ func (p *TelegramPlugin) hasRegisteredPeer(remoteID string) bool {
 	return ok
 }
 
+// registeredPeer devuelve el peer registrado explícitamente (no sintetizado).
+func (p *TelegramPlugin) registeredPeer(remoteID string) *peerInfo {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.peers[remoteID]
+}
+
 // digitsOf deja solo los dígitos de un identificador remoto.
 func digitsOf(value string) string {
 	var b strings.Builder
@@ -144,33 +154,142 @@ func channelRemoteID(id int64) string { return "c" + strconv.FormatInt(id, 10) }
 
 // syncDialogs lista los chats reales de la cuenta y los publica al core.
 func (p *TelegramPlugin) syncDialogs(ctx context.Context, client *telegram.Client) {
+	p.syncDialogsAPI(ctx, client.API())
+}
+
+const (
+	// dialogsPageLimit es el tamaño de página de messages.getDialogs.
+	dialogsPageLimit = 100
+	// maxDialogPages acota la paginación para no iterar sin fin.
+	maxDialogPages = 50
+)
+
+// dialogsAPI es la parte de la API de Telegram que usa la sincronización de chats.
+// *tg.Client la satisface; los tests inyectan un doble.
+type dialogsAPI interface {
+	MessagesGetDialogs(ctx context.Context, request *tg.MessagesGetDialogsRequest) (tg.MessagesDialogsClass, error)
+	MessagesGetForumTopics(ctx context.Context, request *tg.MessagesGetForumTopicsRequest) (*tg.MessagesForumTopics, error)
+	MessagesGetHistory(ctx context.Context, request *tg.MessagesGetHistoryRequest) (tg.MessagesMessagesClass, error)
+}
+
+// syncDialogsAPI implementa syncDialogs sobre una API inyectable.
+func (p *TelegramPlugin) syncDialogsAPI(ctx context.Context, api dialogsAPI) {
 	p.mu.Lock()
 	p.lastDialogSync = time.Now()
 	p.mu.Unlock()
 
-	res, err := client.API().MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
+	req := &tg.MessagesGetDialogsRequest{
 		OffsetPeer: &tg.InputPeerEmpty{},
-		Limit:      100,
-	})
-	if err != nil {
-		log.Printf("⚠️ no se pudieron listar los chats de Telegram: %v", err)
-		return
+		Limit:      dialogsPageLimit,
 	}
+	for page := 0; page < maxDialogPages; page++ {
+		res, err := api.MessagesGetDialogs(ctx, req)
+		if err != nil {
+			log.Printf("⚠️ no se pudieron listar los chats de Telegram: %v", err)
+			return
+		}
 
-	var users []tg.UserClass
-	var chats []tg.ChatClass
-	var dialogs []tg.DialogClass
-	var messages []tg.MessageClass
-	switch d := res.(type) {
-	case *tg.MessagesDialogs:
-		dialogs, users, chats, messages = d.Dialogs, d.Users, d.Chats, d.Messages
-	case *tg.MessagesDialogsSlice:
-		dialogs, users, chats, messages = d.Dialogs, d.Users, d.Chats, d.Messages
+		var users []tg.UserClass
+		var chats []tg.ChatClass
+		var dialogs []tg.DialogClass
+		var messages []tg.MessageClass
+		more := false
+		switch d := res.(type) {
+		case *tg.MessagesDialogs:
+			dialogs, users, chats, messages = d.Dialogs, d.Users, d.Chats, d.Messages
+		case *tg.MessagesDialogsSlice:
+			dialogs, users, chats, messages = d.Dialogs, d.Users, d.Chats, d.Messages
+			more = true
+		}
+
+		p.applyUsers(users)
+		p.applyChats(ctx, api, chats)
+		p.publishUnreadDialogs(dialogs, messages)
+
+		// Una página corta (o la respuesta completa sin "slice") es la última.
+		if !more || len(dialogs) < dialogsPageLimit {
+			return
+		}
+		next := nextDialogsRequest(dialogs, messages, users, chats)
+		if next == nil || (next.OffsetDate == req.OffsetDate && next.OffsetID == req.OffsetID && sameInputPeer(next.OffsetPeer, req.OffsetPeer)) {
+			return // sin progreso: evita iterar sobre la misma página
+		}
+		req = next
 	}
+	log.Printf("⚠️ se alcanzó el límite de %d páginas de chats de Telegram", maxDialogPages)
+}
 
-	p.applyUsers(users)
-	p.applyChats(ctx, client, chats)
-	p.publishUnreadDialogs(dialogs, messages)
+// nextDialogsRequest arma la petición de la página siguiente a partir del último
+// diálogo (offset_date/offset_id/offset_peer). Devuelve nil si no puede resolverse.
+func nextDialogsRequest(dialogs []tg.DialogClass, messages []tg.MessageClass, users []tg.UserClass, chats []tg.ChatClass) *tg.MessagesGetDialogsRequest {
+	last, ok := dialogs[len(dialogs)-1].(*tg.Dialog)
+	if !ok || last == nil {
+		return nil
+	}
+	offsetPeer := inputPeerForDialog(last.Peer, users, chats)
+	if offsetPeer == nil {
+		return nil
+	}
+	req := &tg.MessagesGetDialogsRequest{
+		OffsetPeer: offsetPeer,
+		OffsetID:   last.TopMessage,
+		Limit:      dialogsPageLimit,
+	}
+	for _, mc := range messages {
+		if msg, ok := mc.(*tg.Message); ok && msg != nil && msg.ID == last.TopMessage && samePeer(msg.PeerID, last.Peer) {
+			req.OffsetDate = msg.Date
+			break
+		}
+		if msg, ok := mc.(*tg.MessageService); ok && msg != nil && msg.ID == last.TopMessage && samePeer(msg.PeerID, last.Peer) {
+			req.OffsetDate = msg.Date
+			break
+		}
+	}
+	return req
+}
+
+// samePeer compara dos peers de Telegram por tipo e id.
+func samePeer(a, b tg.PeerClass) bool {
+	ra, _, ia := remoteIDForPeer(a)
+	rb, _, ib := remoteIDForPeer(b)
+	return ra != "" && ra == rb && ia == ib
+}
+
+// sameInputPeer compara dos InputPeer por tipo e id.
+func sameInputPeer(a, b tg.InputPeerClass) bool {
+	switch x := a.(type) {
+	case *tg.InputPeerUser:
+		y, ok := b.(*tg.InputPeerUser)
+		return ok && x.UserID == y.UserID
+	case *tg.InputPeerChat:
+		y, ok := b.(*tg.InputPeerChat)
+		return ok && x.ChatID == y.ChatID
+	case *tg.InputPeerChannel:
+		y, ok := b.(*tg.InputPeerChannel)
+		return ok && x.ChannelID == y.ChannelID
+	}
+	return false
+}
+
+// inputPeerForDialog resuelve el InputPeer (con access hash) de un diálogo.
+func inputPeerForDialog(peer tg.PeerClass, users []tg.UserClass, chats []tg.ChatClass) tg.InputPeerClass {
+	switch v := peer.(type) {
+	case *tg.PeerUser:
+		for _, uc := range users {
+			if u, ok := uc.(*tg.User); ok && u != nil && u.ID == v.UserID {
+				return &tg.InputPeerUser{UserID: u.ID, AccessHash: u.AccessHash}
+			}
+		}
+	case *tg.PeerChat:
+		return &tg.InputPeerChat{ChatID: v.ChatID}
+	case *tg.PeerChannel:
+		for _, cc := range chats {
+			if c, ok := cc.(*tg.Channel); ok && c != nil && c.ID == v.ChannelID {
+				return &tg.InputPeerChannel{ChannelID: c.ID, AccessHash: c.AccessHash}
+			}
+		}
+	}
+	return nil
 }
 
 // publishUnreadDialogs publica el último mensaje de los chats con no leídos.
@@ -302,7 +421,7 @@ func (p *TelegramPlugin) SyncContacts(ctx context.Context, req *conduitv1.SyncCo
 }
 
 // applyChats publica grupos y canales respetando la jerarquía del servidor.
-func (p *TelegramPlugin) applyChats(ctx context.Context, client *telegram.Client, chats []tg.ChatClass) {
+func (p *TelegramPlugin) applyChats(ctx context.Context, api dialogsAPI, chats []tg.ChatClass) {
 	for _, cc := range chats {
 		switch chat := cc.(type) {
 		case *tg.Chat:
@@ -340,11 +459,16 @@ func (p *TelegramPlugin) applyChats(ctx context.Context, client *telegram.Client
 				peer:        &tg.InputPeerChannel{ChannelID: chat.ID, AccessHash: chat.AccessHash},
 			})
 
-			if chat.Forum && client != nil {
-				synced := p.syncForumTopics(ctx, client, chat)
-				if synced > 0 {
-					continue
+			if chat.Forum {
+				// Un foro nunca se publica como canal con el nombre del grupo: sus
+				// mensajes viven en temas. Con error de API no se emite nada; con
+				// lista vacía syncForumTopics publica el tema General.
+				if api != nil {
+					if _, err := p.syncForumTopics(ctx, api, chat); err != nil {
+						log.Printf("⚠️ foro %s omitido: sin temas por error de API", chat.Title)
+					}
 				}
+				continue
 			}
 
 			p.emit(&conduitv1.PluginEvent{
@@ -362,30 +486,15 @@ func (p *TelegramPlugin) applyChats(ctx context.Context, client *telegram.Client
 	}
 }
 
-// syncForumTopics consulta los temas de un supergrupo con foro en Telegram y los publica.
-func (p *TelegramPlugin) syncForumTopics(ctx context.Context, client *telegram.Client, chat *tg.Channel) int {
-	if client == nil || chat == nil || !chat.Forum {
-		return 0
-	}
-	serverRemoteID := channelRemoteID(chat.ID)
-	inputPeer := &tg.InputPeerChannel{ChannelID: chat.ID, AccessHash: chat.AccessHash}
-
-	res, err := client.API().MessagesGetForumTopics(ctx, &tg.MessagesGetForumTopicsRequest{
-		Peer:  inputPeer,
-		Limit: 100,
-	})
-	if err != nil {
-		log.Printf("⚠️ no se pudieron obtener los temas del foro %s: %v", chat.Title, err)
-		return 0
-	}
-	if res == nil || len(res.Topics) == 0 {
-		return 0
-	}
-	return p.applyForumTopics(serverRemoteID, chat.Title, inputPeer, res.Topics)
-}
-
 // applyForumTopics publica los temas de un foro como canales hijos y recuerda sus peers.
-func (p *TelegramPlugin) applyForumTopics(serverRemoteID, serverTitle string, parentPeer tg.InputPeerClass, topics []tg.ForumTopicClass) int {
+//
+// El nombre de cada tema se resuelve en este orden, de lo más barato a lo más caro:
+// el propio tema, los mensajes de servicio create/edit de la respuesta de
+// messages.getForumTopics y, solo si ambos fallan, una única lectura acotada del
+// mensaje raíz del tema. Nunca se inventa un nombre: un tema sin título no se
+// publica (sigue en la lista viva del reconcile) hasta que su nombre se conozca.
+func (p *TelegramPlugin) applyForumTopics(ctx context.Context, api dialogsAPI, serverRemoteID, serverTitle string, parentPeer tg.InputPeerClass, list forumTopicList) int {
+	topics := list.topics
 	hasTopic1 := false
 	for _, tc := range topics {
 		if t, ok := tc.(*tg.ForumTopic); ok && t != nil && t.ID == 1 {
@@ -404,24 +513,34 @@ func (p *TelegramPlugin) applyForumTopics(serverRemoteID, serverTitle string, pa
 		}}, topics...)
 	}
 
+	titles := collectTopicTitles(list.messages)
+	lookedUp := make(map[int]bool)
+	var unknown []int
 	count := 0
 	for _, tc := range topics {
+		if deleted, ok := tc.(*tg.ForumTopicDeleted); ok && deleted != nil {
+			p.markTopicDeleted(topicRemoteID(serverRemoteID, deleted.ID))
+			continue
+		}
 		topic, ok := tc.(*tg.ForumTopic)
 		if !ok || topic == nil {
 			continue
 		}
 
-		topicTitle := strings.TrimSpace(topic.Title)
-		if topicTitle == "" {
-			if topic.ID == 1 {
-				topicTitle = "General"
-			} else {
-				topicTitle = fmt.Sprintf("Tema %d", topic.ID)
-			}
-		}
+		topicTitle, known := topicTitleFor(ctx, api, parentPeer, topic, titles, lookedUp)
 
 		remoteID := topicRemoteID(serverRemoteID, topic.ID)
 
+		p.clearTopicDeleted(remoteID)
+		if !known {
+			// Sin nombre real no se publica ni se registra: una conversación
+			// llamada "Tema N" no existe en Telegram.
+			unknown = append(unknown, topic.ID)
+			continue
+		}
+		if info := p.registeredPeer(remoteID); info != nil && strings.TrimSpace(info.title) == topicTitle {
+			continue // el nombre no cambió: no se reemite en cada barrido
+		}
 		p.rememberPeer(&peerInfo{
 			remoteID:    remoteID,
 			kind:        kindChannel,
@@ -451,7 +570,34 @@ func (p *TelegramPlugin) applyForumTopics(serverRemoteID, serverTitle string, pa
 		})
 		count++
 	}
+	if len(unknown) > 0 {
+		// Se registra una sola vez por pasada: el tema sigue vivo y se publicará
+		// en cuanto su nombre se conozca.
+		log.Printf("⚠️ temas sin título conocido en %s (%s): %v; no se publican hasta conocer su nombre", serverTitle, serverRemoteID, unknown)
+	}
 	return count
+}
+
+// topicTitleFor resuelve el nombre real de un tema. El segundo valor es false
+// cuando el nombre sigue siendo desconocido tras agotar las fuentes.
+func topicTitleFor(ctx context.Context, api dialogsAPI, parentPeer tg.InputPeerClass, topic *tg.ForumTopic, titles map[int]topicTitle, lookedUp map[int]bool) (string, bool) {
+	if title := strings.TrimSpace(topic.Title); title != "" {
+		return title, true
+	}
+	if topic.ID == generalTopicID {
+		return "General", true // General es el único nombre que Telegram no edita
+	}
+	if title := topicTitleFromMessages(titles, topic); title != "" {
+		return title, true
+	}
+	if lookedUp[topic.ID] {
+		return "", false
+	}
+	lookedUp[topic.ID] = true // como mucho una lectura por tema y pasada
+	if title := lookupTopicTitle(ctx, api, parentPeer, topic); title != "" {
+		return title, true
+	}
+	return "", false
 }
 
 // channelTypeFor clasifica un canal de Telegram para la navegación drill-down.
@@ -525,6 +671,11 @@ func (p *TelegramPlugin) rememberEntities(e *tg.Entities) {
 
 // handleMessage convierte un mensaje MTProto en un evento para el core.
 func (p *TelegramPlugin) handleMessage(e *tg.Entities, m tg.MessageClass) {
+	if service, ok := m.(*tg.MessageService); ok && service != nil {
+		// Crear o editar un tema no llega como mensaje normal: dispara un resync del foro.
+		p.handleServiceMessage(service)
+		return
+	}
 	msg, ok := m.(*tg.Message)
 	if !ok || msg == nil {
 		return
@@ -624,9 +775,9 @@ func (p *TelegramPlugin) messageEvent(msg *tg.Message, remoteID string, kind pee
 			}
 		}
 		if topicID == 0 {
-			if p.hasRegisteredPeer(topicRemoteID(remoteID, 1)) {
-				topicID = 1
-			}
+			// Todo foro tiene el tema General (1): un mensaje sin tema resoluble
+			// va ahí, nunca a un canal con el nombre del grupo.
+			topicID = 1
 		}
 		if topicID > 0 {
 			targetRemoteID = topicRemoteID(remoteID, topicID)
@@ -723,16 +874,22 @@ func (p *TelegramPlugin) applyServerIdentity(event *conduitv1.PluginEvent, remot
 
 		topicRemoteID := topicRemoteID(remoteID, topicID)
 		topicTitle := ""
-		if tInfo := p.lookupPeer(topicRemoteID); tInfo != nil && tInfo.title != "" {
-			topicTitle = tInfo.title
-		} else if topicID == 1 {
+		// lookupPeer resuelve temas no registrados con el título del grupo, así
+		// que solo se confía en el título de un tema registrado explícitamente.
+		switch {
+		case p.hasRegisteredPeer(topicRemoteID):
+			if tInfo := p.lookupPeer(topicRemoteID); tInfo != nil {
+				topicTitle = tInfo.title
+			}
+		case topicID == 1:
 			topicTitle = "General"
-		} else {
-			topicTitle = fmt.Sprintf("Tema %d", topicID)
 		}
+		// Un tema sin nombre conocido no se publica con un nombre inventado: el
+		// core completa el título cuando lo reciba y mientras tanto no debe
+		// confundirlo con el nombre del grupo.
 		event.ChannelName = topicTitle
 
-		if info != nil && p.lookupPeer(topicRemoteID) == nil {
+		if info != nil && !p.hasRegisteredPeer(topicRemoteID) && topicID == 1 {
 			p.rememberPeer(&peerInfo{
 				remoteID:    topicRemoteID,
 				kind:        kindChannel,

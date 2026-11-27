@@ -34,14 +34,18 @@ type TelegramPlugin struct {
 	peersByID      map[string]*peerInfo // índice por dígitos: el core normaliza los ids como teléfonos
 	lastDialogSync time.Time
 	eventCh        chan *conduitv1.PluginEvent
+	topicSync      *forumResyncer
+	// deletedTopics recuerda los temas borrados para no volver a sintetizar su peer.
+	deletedTopics map[string]struct{}
 }
 
 // NewTelegramPlugin inicializa el plugin de Telegram.
 func NewTelegramPlugin() *TelegramPlugin {
 	return &TelegramPlugin{
-		peers:     make(map[string]*peerInfo),
-		peersByID: make(map[string]*peerInfo),
-		eventCh:   make(chan *conduitv1.PluginEvent, 512),
+		peers:         make(map[string]*peerInfo),
+		peersByID:     make(map[string]*peerInfo),
+		deletedTopics: make(map[string]struct{}),
+		eventCh:       make(chan *conduitv1.PluginEvent, 512),
 	}
 }
 
