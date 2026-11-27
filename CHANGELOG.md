@@ -9,6 +9,8 @@ Every pull request with a user-visible change adds an entry under
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-27
+
 ### Added
 
 - Continuous forum topic sync: topic pages are fully paginated (`messages.getForumTopics` with `offset_topic`/`offset_id`/`offset_date`, capped at 50 pages) and a complete list emits one `channel.reconcile` event per forum (`ServerId`, newline-separated live topic ids in `Body`, `SentAtUnix` = fetch start). An incomplete or failed list never emits it, because the core deletes what is missing irreversibly.
@@ -68,7 +70,8 @@ Tagged, but the release build failed and no binaries were published. Use
 - Plugin manifest (`GetManifest`) so the desktop app renders the account form
   and QR instructions.
 
-[Unreleased]: https://github.com/cestila/conduit-plugin-telegram/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/cestila/conduit-plugin-telegram/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/cestila/conduit-plugin-telegram/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/cestila/conduit-plugin-telegram/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/cestila/conduit-plugin-telegram/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/cestila/conduit-plugin-telegram/compare/v0.1.1...v0.1.2
