@@ -69,7 +69,13 @@ type fakeDialogsAPI struct {
 	// topicPageErrs devuelve un error a partir de la petición N (base 0) del canal.
 	topicPageErrs map[int64]int
 
+	// history responde a messages.getHistory por mensaje raíz del tema; la
+	// petición pide OffsetID = top+1 y Limit 1, así que la clave es OffsetID-1.
+	history     map[int]*tg.MessagesMessages
+	historyErrs map[int64]error
+
 	mu          sync.Mutex
+	historyReqs []*tg.MessagesGetHistoryRequest
 	topicReqs   []*tg.MessagesGetForumTopicsRequest
 	firstReqAt  int64 // unix en que llegó la primera petición de temas
 	inflight    int
@@ -136,6 +142,27 @@ func (f *fakeDialogsAPI) MessagesGetForumTopics(_ context.Context, req *tg.Messa
 		return pages[n], nil
 	}
 	return f.topics[id], nil
+}
+
+func (f *fakeDialogsAPI) MessagesGetHistory(_ context.Context, req *tg.MessagesGetHistoryRequest) (tg.MessagesMessagesClass, error) {
+	f.mu.Lock()
+	f.historyReqs = append(f.historyReqs, req)
+	f.mu.Unlock()
+	if id, ok := req.Peer.(*tg.InputPeerChannel); ok {
+		if err := f.historyErrs[id.ChannelID]; err != nil {
+			return nil, err
+		}
+	}
+	if res, ok := f.history[req.OffsetID-1]; ok {
+		return res, nil
+	}
+	return &tg.MessagesMessages{}, nil
+}
+
+func (f *fakeDialogsAPI) historyRequests() []*tg.MessagesGetHistoryRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*tg.MessagesGetHistoryRequest(nil), f.historyReqs...)
 }
 
 func (f *fakeDialogsAPI) topicRequests() []*tg.MessagesGetForumTopicsRequest {

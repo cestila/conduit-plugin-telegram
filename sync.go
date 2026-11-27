@@ -117,6 +117,13 @@ func (p *TelegramPlugin) hasRegisteredPeer(remoteID string) bool {
 	return ok
 }
 
+// registeredPeer devuelve el peer registrado explícitamente (no sintetizado).
+func (p *TelegramPlugin) registeredPeer(remoteID string) *peerInfo {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.peers[remoteID]
+}
+
 // digitsOf deja solo los dígitos de un identificador remoto.
 func digitsOf(value string) string {
 	var b strings.Builder
@@ -162,6 +169,7 @@ const (
 type dialogsAPI interface {
 	MessagesGetDialogs(ctx context.Context, request *tg.MessagesGetDialogsRequest) (tg.MessagesDialogsClass, error)
 	MessagesGetForumTopics(ctx context.Context, request *tg.MessagesGetForumTopicsRequest) (*tg.MessagesForumTopics, error)
+	MessagesGetHistory(ctx context.Context, request *tg.MessagesGetHistoryRequest) (tg.MessagesMessagesClass, error)
 }
 
 // syncDialogsAPI implementa syncDialogs sobre una API inyectable.
@@ -479,7 +487,14 @@ func (p *TelegramPlugin) applyChats(ctx context.Context, api dialogsAPI, chats [
 }
 
 // applyForumTopics publica los temas de un foro como canales hijos y recuerda sus peers.
-func (p *TelegramPlugin) applyForumTopics(serverRemoteID, serverTitle string, parentPeer tg.InputPeerClass, topics []tg.ForumTopicClass) int {
+//
+// El nombre de cada tema se resuelve en este orden, de lo más barato a lo más caro:
+// el propio tema, los mensajes de servicio create/edit de la respuesta de
+// messages.getForumTopics y, solo si ambos fallan, una única lectura acotada del
+// mensaje raíz del tema. Nunca se inventa un nombre: un tema sin título no se
+// publica (sigue en la lista viva del reconcile) hasta que su nombre se conozca.
+func (p *TelegramPlugin) applyForumTopics(ctx context.Context, api dialogsAPI, serverRemoteID, serverTitle string, parentPeer tg.InputPeerClass, list forumTopicList) int {
+	topics := list.topics
 	hasTopic1 := false
 	for _, tc := range topics {
 		if t, ok := tc.(*tg.ForumTopic); ok && t != nil && t.ID == 1 {
@@ -498,6 +513,9 @@ func (p *TelegramPlugin) applyForumTopics(serverRemoteID, serverTitle string, pa
 		}}, topics...)
 	}
 
+	titles := collectTopicTitles(list.messages)
+	lookedUp := make(map[int]bool)
+	var unknown []int
 	count := 0
 	for _, tc := range topics {
 		if deleted, ok := tc.(*tg.ForumTopicDeleted); ok && deleted != nil {
@@ -509,18 +527,20 @@ func (p *TelegramPlugin) applyForumTopics(serverRemoteID, serverTitle string, pa
 			continue
 		}
 
-		topicTitle := strings.TrimSpace(topic.Title)
-		if topicTitle == "" {
-			if topic.ID == 1 {
-				topicTitle = "General"
-			} else {
-				topicTitle = fmt.Sprintf("Tema %d", topic.ID)
-			}
-		}
+		topicTitle, known := topicTitleFor(ctx, api, parentPeer, topic, titles, lookedUp)
 
 		remoteID := topicRemoteID(serverRemoteID, topic.ID)
 
 		p.clearTopicDeleted(remoteID)
+		if !known {
+			// Sin nombre real no se publica ni se registra: una conversación
+			// llamada "Tema N" no existe en Telegram.
+			unknown = append(unknown, topic.ID)
+			continue
+		}
+		if info := p.registeredPeer(remoteID); info != nil && strings.TrimSpace(info.title) == topicTitle {
+			continue // el nombre no cambió: no se reemite en cada barrido
+		}
 		p.rememberPeer(&peerInfo{
 			remoteID:    remoteID,
 			kind:        kindChannel,
@@ -550,7 +570,34 @@ func (p *TelegramPlugin) applyForumTopics(serverRemoteID, serverTitle string, pa
 		})
 		count++
 	}
+	if len(unknown) > 0 {
+		// Se registra una sola vez por pasada: el tema sigue vivo y se publicará
+		// en cuanto su nombre se conozca.
+		log.Printf("⚠️ temas sin título conocido en %s (%s): %v; no se publican hasta conocer su nombre", serverTitle, serverRemoteID, unknown)
+	}
 	return count
+}
+
+// topicTitleFor resuelve el nombre real de un tema. El segundo valor es false
+// cuando el nombre sigue siendo desconocido tras agotar las fuentes.
+func topicTitleFor(ctx context.Context, api dialogsAPI, parentPeer tg.InputPeerClass, topic *tg.ForumTopic, titles map[int]topicTitle, lookedUp map[int]bool) (string, bool) {
+	if title := strings.TrimSpace(topic.Title); title != "" {
+		return title, true
+	}
+	if topic.ID == generalTopicID {
+		return "General", true // General es el único nombre que Telegram no edita
+	}
+	if title := topicTitleFromMessages(titles, topic); title != "" {
+		return title, true
+	}
+	if lookedUp[topic.ID] {
+		return "", false
+	}
+	lookedUp[topic.ID] = true // como mucho una lectura por tema y pasada
+	if title := lookupTopicTitle(ctx, api, parentPeer, topic); title != "" {
+		return title, true
+	}
+	return "", false
 }
 
 // channelTypeFor clasifica un canal de Telegram para la navegación drill-down.
@@ -829,16 +876,20 @@ func (p *TelegramPlugin) applyServerIdentity(event *conduitv1.PluginEvent, remot
 		topicTitle := ""
 		// lookupPeer resuelve temas no registrados con el título del grupo, así
 		// que solo se confía en el título de un tema registrado explícitamente.
-		if tInfo := p.lookupPeer(topicRemoteID); p.hasRegisteredPeer(topicRemoteID) && tInfo != nil && tInfo.title != "" {
-			topicTitle = tInfo.title
-		} else if topicID == 1 {
+		switch {
+		case p.hasRegisteredPeer(topicRemoteID):
+			if tInfo := p.lookupPeer(topicRemoteID); tInfo != nil {
+				topicTitle = tInfo.title
+			}
+		case topicID == 1:
 			topicTitle = "General"
-		} else {
-			topicTitle = fmt.Sprintf("Tema %d", topicID)
 		}
+		// Un tema sin nombre conocido no se publica con un nombre inventado: el
+		// core completa el título cuando lo reciba y mientras tanto no debe
+		// confundirlo con el nombre del grupo.
 		event.ChannelName = topicTitle
 
-		if info != nil && !p.hasRegisteredPeer(topicRemoteID) {
+		if info != nil && !p.hasRegisteredPeer(topicRemoteID) && topicID == 1 {
 			p.rememberPeer(&peerInfo{
 				remoteID:    topicRemoteID,
 				kind:        kindChannel,

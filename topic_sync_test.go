@@ -673,3 +673,195 @@ func TestStartTopicSyncReplacesPreviousResyncer(t *testing.T) {
 	cancel2()
 	p.topicSync.wait()
 }
+
+// --- S4: títulos reales de los temas, nunca "Tema N" ---
+
+func bareTopic(id int) *tg.ForumTopic {
+	return &tg.ForumTopic{ID: id, TopMessage: 1000 + id, Date: 1_700_000_000 + id}
+}
+
+func topicCreateMessage(topID int, title string) *tg.MessageService {
+	return &tg.MessageService{
+		ID:      1000 + topID,
+		PeerID:  &tg.PeerChannel{ChannelID: 555},
+		Date:    1_700_000_000 + topID,
+		ReplyTo: &tg.MessageReplyHeader{ForumTopic: true, ReplyToTopID: 1000 + topID, ReplyToMsgID: 1000 + topID},
+		Action:  &tg.MessageActionTopicCreate{Title: title},
+	}
+}
+
+func topicEditMessage(topID, msgID int, title string) *tg.MessageService {
+	return &tg.MessageService{
+		ID:      msgID,
+		PeerID:  &tg.PeerChannel{ChannelID: 555},
+		Date:    1_700_000_500 + msgID,
+		ReplyTo: &tg.MessageReplyHeader{ForumTopic: true, ReplyToTopID: 1000 + topID, ReplyToMsgID: 1000 + topID},
+		Action:  &tg.MessageActionTopicEdit{Title: title},
+	}
+}
+
+func syncNamedEvents(events []*conduitv1.PluginEvent) []string {
+	var out []string
+	for _, ev := range events {
+		if ev.EventType == "channel.sync" {
+			out = append(out, ev.RemoteSenderId+"="+ev.ChannelName)
+		}
+	}
+	return out
+}
+
+// (a) El título sale del mensaje de servicio create/edit que viene en la propia
+// respuesta de messages.getForumTopics, sin pedir nada más.
+func TestSyncForumTopicsTitleFromTopicActionMessage(t *testing.T) {
+	p := NewTelegramPlugin()
+	api := &fakeDialogsAPI{topics: map[int64]*tg.MessagesForumTopics{555: {
+		Count:    2,
+		Topics:   []tg.ForumTopicClass{bareTopic(5), bareTopic(7)},
+		Messages: []tg.MessageClass{topicCreateMessage(5, "Backend Go"), topicEditMessage(7, 1077, "Deploy")},
+	}}}
+	if _, err := p.syncForumTopics(context.Background(), api, testForum(555)); err != nil {
+		t.Fatal(err)
+	}
+	names := syncNamedEvents(drainFull(p))
+	want := []string{"c555_topic_1=General", "c555_topic_5=Backend Go", "c555_topic_7=Deploy"}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("títulos inesperados:\n got %v\nwant %v", names, want)
+	}
+	if n := len(api.historyRequests()); n != 0 {
+		t.Fatalf("no hace falta leer el mensaje raíz, hubo %d peticiones", n)
+	}
+}
+
+// (b) Sin acción en la respuesta se lee el mensaje raíz del tema una sola vez;
+// si el título ya está presente no se pide nada.
+func TestSyncForumTopicsTitleFromTopMessageLookup(t *testing.T) {
+	p := NewTelegramPlugin()
+	api := &fakeDialogsAPI{
+		topics: map[int64]*tg.MessagesForumTopics{555: {
+			Count:  2,
+			Topics: []tg.ForumTopicClass{bareTopic(5), &tg.ForumTopic{ID: 7, TopMessage: 1007, Title: "Ya tiene nombre", Date: 1_700_000_007}},
+		}},
+		history: map[int]*tg.MessagesMessages{1005: {Messages: []tg.MessageClass{topicCreateMessage(5, "Backend Go")}}},
+	}
+	if _, err := p.syncForumTopics(context.Background(), api, testForum(555)); err != nil {
+		t.Fatal(err)
+	}
+	names := syncNamedEvents(drainFull(p))
+	want := []string{"c555_topic_1=General", "c555_topic_5=Backend Go", "c555_topic_7=Ya tiene nombre"}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("títulos inesperados:\n got %v\nwant %v", names, want)
+	}
+	reqs := api.historyRequests()
+	if len(reqs) != 1 {
+		t.Fatalf("se esperaba una sola lectura del mensaje raíz, hubo %d", len(reqs))
+	}
+	if req := reqs[0]; req.Peer.(*tg.InputPeerChannel).ChannelID != 555 || req.OffsetID != 1006 || req.Limit != 1 {
+		t.Fatalf("petición inesperada: peer=%+v offsetID=%d limit=%d", req.Peer, req.OffsetID, req.Limit)
+	}
+}
+
+// (c) Título desconocido: no se publica, no se inventa "Tema N", pero el tema
+// sigue en la lista viva del reconcile para que el core no lo borre.
+func TestSyncForumTopicsUnknownTitleIsNotPublished(t *testing.T) {
+	p := NewTelegramPlugin()
+	api := &fakeDialogsAPI{topics: map[int64]*tg.MessagesForumTopics{555: {
+		Count:  2,
+		Topics: []tg.ForumTopicClass{bareTopic(5), &tg.ForumTopic{ID: 7, TopMessage: 1007, Title: "Real", Date: 1_700_000_007}},
+	}}}
+	if _, err := p.syncForumTopics(context.Background(), api, testForum(555)); err != nil {
+		t.Fatal(err)
+	}
+	events := drainFull(p)
+	for _, ev := range events {
+		if strings.Contains(ev.ChannelName, "Tema 5") || strings.Contains(ev.ChannelName, "Tema") && ev.RemoteSenderId == "c555_topic_5" {
+			t.Fatalf("se publicó un nombre inventado: %+v", ev)
+		}
+		if ev.RemoteSenderId == "c555_topic_5" {
+			t.Fatalf("un tema sin título no se publica: %+v", ev)
+		}
+	}
+	if p.hasRegisteredPeer("c555_topic_5") {
+		t.Fatal("un tema sin título no debe registrarse con un nombre falso")
+	}
+	recs := reconcilesOf(events)
+	if len(recs) != 1 || !strings.Contains(recs[0].Body, "c555_topic_5") {
+		t.Fatalf("el tema sin título debe seguir en la lista viva: %+v", recs)
+	}
+	if !containsEvent(syncNamedEvents(events), "c555_topic_7=Real") {
+		t.Fatalf("los temas con título sí se publican: %v", syncNamedEvents(events))
+	}
+}
+
+// (d) Un tema ya registrado cuyo nombre cambió se vuelve a publicar; el que no
+// cambió no se reemite en cada barrido.
+func TestSyncForumTopicsRenameWhenTitleBecomesKnown(t *testing.T) {
+	p := NewTelegramPlugin()
+	parent := &tg.InputPeerChannel{ChannelID: 555, AccessHash: 1}
+	for id, title := range map[int]string{1: "General", 5: "Viejo", 7: "Igual"} {
+		p.rememberPeer(&peerInfo{remoteID: topicRemoteID("c555", id), kind: kindChannel, id: int64(id), title: title,
+			channelType: "forum", topicID: id, peer: parent})
+	}
+	api := &fakeDialogsAPI{topics: map[int64]*tg.MessagesForumTopics{555: {
+		Count:    2,
+		Topics:   []tg.ForumTopicClass{bareTopic(5), &tg.ForumTopic{ID: 7, TopMessage: 1007, Title: "Igual", Date: 1_700_000_007}},
+		Messages: []tg.MessageClass{topicEditMessage(5, 1055, "Nuevo")},
+	}}}
+	if _, err := p.syncForumTopics(context.Background(), api, testForum(555)); err != nil {
+		t.Fatal(err)
+	}
+	names := syncNamedEvents(drainFull(p))
+	if strings.Join(names, ",") != "c555_topic_5=Nuevo" {
+		t.Fatalf("solo el tema renombrado se reemite, llegó %v", names)
+	}
+	if info := p.lookupPeer("c555_topic_5"); info == nil || info.title != "Nuevo" {
+		t.Fatalf("el peer debe quedar con el título nuevo: %+v", info)
+	}
+}
+
+// (e) General siempre se llama "General" y no dispara lecturas extra.
+func TestSyncForumTopicsGeneralKeepsNameWithoutLookup(t *testing.T) {
+	p := NewTelegramPlugin()
+	api := &fakeDialogsAPI{topics: map[int64]*tg.MessagesForumTopics{555: {
+		Count:  1,
+		Topics: []tg.ForumTopicClass{bareTopic(1)},
+	}}}
+	if _, err := p.syncForumTopics(context.Background(), api, testForum(555)); err != nil {
+		t.Fatal(err)
+	}
+	names := syncNamedEvents(drainFull(p))
+	if strings.Join(names, ",") != "c555_topic_1=General" {
+		t.Fatalf("General debe llamarse General: %v", names)
+	}
+	if n := len(api.historyRequests()); n != 0 {
+		t.Fatalf("General no necesita leer su mensaje raíz, hubo %d peticiones", n)
+	}
+}
+
+// PRESERVE: un barrido repetido sin cambios sigue publicando el reconcile (el
+// core debe seguir viendo la lista viva) pero no reemite los channel.sync.
+func TestSyncForumTopicsRepeatSweepStillReconciles(t *testing.T) {
+	p := NewTelegramPlugin()
+	api := &fakeDialogsAPI{topics: map[int64]*tg.MessagesForumTopics{555: {
+		Count:    2,
+		Topics:   []tg.ForumTopicClass{bareTopic(5), bareTopic(7)},
+		Messages: []tg.MessageClass{topicCreateMessage(5, "Backend Go"), topicCreateMessage(7, "Deploy")},
+	}}}
+	if _, err := p.syncForumTopics(context.Background(), api, testForum(555)); err != nil {
+		t.Fatal(err)
+	}
+	first := drainFull(p)
+	if len(syncNamedEvents(first)) != 3 {
+		t.Fatalf("el primer barrido publica General y los 2 temas: %v", syncNamedEvents(first))
+	}
+	if _, err := p.syncForumTopics(context.Background(), api, testForum(555)); err != nil {
+		t.Fatal(err)
+	}
+	second := drainFull(p)
+	if names := syncNamedEvents(second); len(names) != 0 {
+		t.Fatalf("sin cambios no se reemiten temas: %v", names)
+	}
+	recs := reconcilesOf(second)
+	if len(recs) != 1 || recs[0].Body != "c555_topic_1\nc555_topic_5\nc555_topic_7" {
+		t.Fatalf("el reconcile debe seguir saliendo igual: %+v", recs)
+	}
+}

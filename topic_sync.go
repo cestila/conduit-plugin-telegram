@@ -33,6 +33,7 @@ const (
 // forumTopicList es el resultado de paginar los temas de un foro.
 type forumTopicList struct {
 	topics   []tg.ForumTopicClass // únicos, en el orden en que llegaron (incluye eliminados)
+	messages []tg.MessageClass    // mensajes de servicio que acompañan a los temas (títulos)
 	expected int                  // mayor Count informado por Telegram
 	deleted  int                  // stubs ForumTopicDeleted vistos en las páginas
 	ended    bool                 // la paginación llegó al final de la lista
@@ -58,6 +59,7 @@ func fetchForumTopicPass(ctx context.Context, api dialogsAPI, peer tg.InputPeerC
 		if res.Count > out.expected {
 			out.expected = res.Count
 		}
+		out.messages = append(out.messages, res.Messages...)
 		fresh := 0
 		for _, tc := range res.Topics {
 			id := forumTopicID(tc)
@@ -154,6 +156,148 @@ func forumTopicID(tc tg.ForumTopicClass) int {
 	return 0
 }
 
+// --- títulos reales de los temas ---
+
+// topicTitle guarda un título y la fecha del mensaje que lo anunció: cuando hay
+// varias ediciones gana la más reciente.
+type topicTitle struct {
+	title string
+	date  int
+}
+
+// topicActionTitle devuelve el título que anuncia una acción de servicio de
+// creación o edición de tema. Vacío si la acción no trae nombre.
+func topicActionTitle(action tg.MessageActionClass) string {
+	switch a := action.(type) {
+	case *tg.MessageActionTopicCreate:
+		if a != nil {
+			return strings.TrimSpace(a.Title)
+		}
+	case *tg.MessageActionTopicEdit:
+		if a != nil {
+			return strings.TrimSpace(a.Title)
+		}
+	}
+	return ""
+}
+
+// replyTopMessageID extrae el id del mensaje raíz del tema de una respuesta.
+func replyTopMessageID(reply tg.MessageReplyHeaderClass) int {
+	if r, ok := reply.(*tg.MessageReplyHeader); ok && r != nil && r.ReplyToTopID > 0 {
+		return r.ReplyToTopID
+	}
+	return 0
+}
+
+// topicActionKeys lista los ids con los que un mensaje de servicio identifica su
+// tema: el propio mensaje solo sirve para create (el primer mensaje ES el tema),
+// el resto se ubica por el mensaje raíz del hilo.
+func topicActionKeys(msg *tg.MessageService) []int {
+	if msg == nil {
+		return nil
+	}
+	var keys []int
+	if top := replyTopMessageID(msg.ReplyTo); top > 0 {
+		keys = append(keys, top)
+	}
+	if _, create := msg.Action.(*tg.MessageActionTopicCreate); create && msg.ID > 0 {
+		keys = append(keys, msg.ID)
+	}
+	return keys
+}
+
+// collectTopicTitles indexa por id de mensaje raíz los títulos de los temas que
+// aparecen como mensajes de servicio create/edit en una respuesta de la API.
+func collectTopicTitles(messages []tg.MessageClass) map[int]topicTitle {
+	titles := make(map[int]topicTitle)
+	for _, mc := range messages {
+		msg, ok := mc.(*tg.MessageService)
+		if !ok || msg == nil {
+			continue
+		}
+		title := topicActionTitle(msg.Action)
+		if title == "" {
+			continue
+		}
+		mergeTopicTitle(titles, topicActionKeys(msg), topicTitle{title: title, date: msg.Date})
+	}
+	return titles
+}
+
+// mergeTopicTitle guarda el título de cada clave solo si es más nuevo.
+func mergeTopicTitle(titles map[int]topicTitle, keys []int, candidate topicTitle) {
+	for _, key := range keys {
+		if key <= 0 {
+			continue
+		}
+		if current, ok := titles[key]; ok && current.date > candidate.date {
+			continue
+		}
+		titles[key] = candidate
+	}
+}
+
+// topicTitleFromMessages busca el título del tema en un índice de títulos.
+func topicTitleFromMessages(titles map[int]topicTitle, topic *tg.ForumTopic) string {
+	if topic == nil {
+		return ""
+	}
+	best := topicTitle{}
+	for _, key := range []int{topic.TopMessage, topic.ID} {
+		found, ok := titles[key]
+		if !ok {
+			continue
+		}
+		if best.title == "" || found.date > best.date {
+			best = found
+		}
+	}
+	return best.title
+}
+
+// topicTitleLookupLimit acota la lectura del mensaje raíz a un solo mensaje.
+const topicTitleLookupLimit = 1
+
+// lookupTopicTitle lee el mensaje raíz del tema y devuelve el título de su acción
+// create/edit. Es una única petición acotada por tema y pasada de sync.
+func lookupTopicTitle(ctx context.Context, api dialogsAPI, peer tg.InputPeerClass, topic *tg.ForumTopic) string {
+	if api == nil || peer == nil || topic == nil || topic.TopMessage <= 0 {
+		return ""
+	}
+	// getHistory devuelve mensajes con id menor que OffsetID, así que el mensaje
+	// raíz (id = TopMessage) se pide con OffsetID = TopMessage+1.
+	res, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+		Peer:     peer,
+		OffsetID: topic.TopMessage + 1,
+		Limit:    topicTitleLookupLimit,
+	})
+	if err != nil {
+		log.Printf("⚠️ no se pudo leer el mensaje raíz del tema %d: %v", topic.ID, err)
+		return ""
+	}
+	titles := collectTopicTitles(messagesOf(res))
+	return topicTitleFromMessages(titles, topic)
+}
+
+// messagesOf aplana los mensajes de una respuesta messages.*.
+func messagesOf(res tg.MessagesMessagesClass) []tg.MessageClass {
+	switch r := res.(type) {
+	case *tg.MessagesMessages:
+		if r != nil {
+			return r.Messages
+		}
+	case *tg.MessagesMessagesSlice:
+		if r != nil {
+			return r.Messages
+		}
+	case *tg.MessagesChannelMessages:
+		if r != nil {
+			return r.Messages
+		}
+	}
+	return nil
+}
+
 // nextForumTopicsRequest arma la página siguiente desde el último tema vivo de la
 // respuesta (offset_topic / offset_id / offset_date del último mensaje del tema).
 // Devuelve nil si no puede resolverse.
@@ -211,7 +355,7 @@ func (p *TelegramPlugin) syncForumTopics(ctx context.Context, api dialogsAPI, ch
 			return 0, err
 		}
 	}
-	count := p.applyForumTopics(serverRemoteID, chat.Title, inputPeer, list.topics)
+	count := p.applyForumTopics(ctx, api, serverRemoteID, chat.Title, inputPeer, list)
 	if err != nil {
 		return count, err
 	}

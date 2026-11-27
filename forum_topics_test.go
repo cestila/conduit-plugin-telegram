@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 
 	"github.com/gotd/td/tg"
@@ -117,8 +118,11 @@ func TestMessageEventForumUnregisteredTopicNeverNamedAfterGroup(t *testing.T) {
 	if ev == nil || ev.RemoteSenderId != "-100556_topic_9" {
 		t.Fatalf("se esperaba enrutar al tema 9, se obtuvo %+v", ev)
 	}
-	if ev.ChannelName == "Nombre Grupo" || ev.ChannelName != "Tema 9" {
-		t.Errorf("el tema no registrado no debe llamarse como el grupo, ChannelName=%q", ev.ChannelName)
+	if ev.ChannelName != "" {
+		t.Errorf("un tema sin nombre conocido no se publica con un nombre inventado, ChannelName=%q", ev.ChannelName)
+	}
+	if p.hasRegisteredPeer("-100556_topic_9") {
+		t.Error("no se registra un peer con un nombre falso")
 	}
 }
 
@@ -198,7 +202,7 @@ func TestApplyForumTopicsEmitsChannelSync(t *testing.T) {
 		},
 	}
 
-	p.applyForumTopics(serverRemoteID, serverTitle, parentPeer, topics)
+	p.applyForumTopics(context.Background(), nil, serverRemoteID, serverTitle, parentPeer, forumTopicList{topics: topics})
 
 	var events []*tgTopicEvent
 	for len(p.eventCh) > 0 {
@@ -256,7 +260,7 @@ func TestApplyForumTopicsGuaranteesGeneralTopic(t *testing.T) {
 		&tg.ForumTopic{ID: 43, Title: "Frontend React", Date: 1_700_001_000},
 	}
 
-	count := p.applyForumTopics(serverRemoteID, serverTitle, parentPeer, topics)
+	count := p.applyForumTopics(context.Background(), nil, serverRemoteID, serverTitle, parentPeer, forumTopicList{topics: topics})
 	if count != 3 {
 		t.Fatalf("se esperaban 3 temas (General inyectado + 2 temas), se obtuvieron %d", count)
 	}
