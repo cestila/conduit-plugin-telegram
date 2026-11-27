@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/gotd/td/tg"
@@ -55,11 +56,28 @@ func TestPublishUnreadDialogsEmiteSoloChatsConNoLeidos(t *testing.T) {
 
 // fakeDialogsAPI es un doble de dialogsAPI: sirve páginas de diálogos en orden
 // y temas de foro por canal, y registra las peticiones recibidas.
+//
+// topicPages sirve una página distinta por cada petición de temas del canal
+// (la última se repite); topics es la respuesta fija de un canal sin páginas.
 type fakeDialogsAPI struct {
 	pages      []tg.MessagesDialogsClass
 	dialogReqs []*tg.MessagesGetDialogsRequest
 	topics     map[int64]*tg.MessagesForumTopics
+	topicPages map[int64][]*tg.MessagesForumTopics
 	topicErrs  map[int64]error
+
+	// topicPageErrs devuelve un error a partir de la petición N (base 0) del canal.
+	topicPageErrs map[int64]int
+
+	mu          sync.Mutex
+	topicReqs   []*tg.MessagesGetForumTopicsRequest
+	firstReqAt  int64 // unix en que llegó la primera petición de temas
+	inflight    int
+	maxInflight int
+	// block, si no es nil, retiene cada petición de temas hasta que se cierre.
+	block chan struct{}
+	// started avisa (sin bloquear) cada vez que llega una petición de temas.
+	started chan struct{}
 }
 
 func (f *fakeDialogsAPI) MessagesGetDialogs(_ context.Context, req *tg.MessagesGetDialogsRequest) (tg.MessagesDialogsClass, error) {
@@ -73,10 +91,57 @@ func (f *fakeDialogsAPI) MessagesGetDialogs(_ context.Context, req *tg.MessagesG
 
 func (f *fakeDialogsAPI) MessagesGetForumTopics(_ context.Context, req *tg.MessagesGetForumTopicsRequest) (*tg.MessagesForumTopics, error) {
 	id := req.Peer.(*tg.InputPeerChannel).ChannelID
+	f.mu.Lock()
+	if f.firstReqAt == 0 {
+		f.firstReqAt = nowUnix()
+	}
+	n := 0
+	for _, r := range f.topicReqs {
+		if r.Peer.(*tg.InputPeerChannel).ChannelID == id {
+			n++
+		}
+	}
+	f.topicReqs = append(f.topicReqs, req)
+	f.inflight++
+	if f.inflight > f.maxInflight {
+		f.maxInflight = f.inflight
+	}
+	block, started := f.block, f.started
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.inflight--
+		f.mu.Unlock()
+	}()
+
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
+	if block != nil {
+		<-block
+	}
 	if err := f.topicErrs[id]; err != nil {
 		return nil, err
 	}
+	if from, ok := f.topicPageErrs[id]; ok && n >= from {
+		return nil, errors.New("page boom")
+	}
+	if pages := f.topicPages[id]; len(pages) > 0 {
+		if n >= len(pages) {
+			n = len(pages) - 1
+		}
+		return pages[n], nil
+	}
 	return f.topics[id], nil
+}
+
+func (f *fakeDialogsAPI) topicRequests() []*tg.MessagesGetForumTopicsRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*tg.MessagesGetForumTopicsRequest(nil), f.topicReqs...)
 }
 
 func drainEvents(p *TelegramPlugin) []string {
@@ -111,7 +176,7 @@ func TestApplyChatsForumTopicsErrorDoesNotPublishParent(t *testing.T) {
 	}
 }
 
-func TestApplyChatsForumEmptyTopicsPublishesOnlyGeneral(t *testing.T) {
+func TestApplyChatsForumEmptyTopicsPublishesGeneralAndReconciles(t *testing.T) {
 	p := NewTelegramPlugin()
 	api := &fakeDialogsAPI{topics: map[int64]*tg.MessagesForumTopics{555: {}}}
 
@@ -119,9 +184,20 @@ func TestApplyChatsForumEmptyTopicsPublishesOnlyGeneral(t *testing.T) {
 		&tg.Channel{ID: 555, AccessHash: 1, Title: "Mi Foro", Forum: true, Megagroup: true},
 	})
 
-	events := drainEvents(p)
-	if len(events) != 1 || events[0] != "channel.sync|c555_topic_1|General" {
-		t.Fatalf("se esperaba solo General, se obtuvo %v", events)
+	events := drainFull(p)
+	if len(events) != 2 {
+		t.Fatalf("se esperaban General y un reconcile, se obtuvo %v", eventTypes(events))
+	}
+	if ev := events[0]; ev.EventType != "channel.sync" || ev.RemoteSenderId != "c555_topic_1" || ev.ChannelName != "General" {
+		t.Fatalf("se esperaba el channel.sync de General, se obtuvo %+v", ev)
+	}
+	if ev := events[1]; ev.EventType != "channel.reconcile" || ev.Body != "c555_topic_1" {
+		t.Fatalf("se esperaba el reconcile de General, se obtuvo %+v", ev)
+	}
+	for _, ev := range events {
+		if ev.RemoteSenderId == "c555" {
+			t.Fatalf("el foro no se publica como canal con el nombre del grupo: %+v", ev)
+		}
 	}
 }
 

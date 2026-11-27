@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -128,10 +129,15 @@ func (p *TelegramPlugin) run(ctx context.Context) {
 		p.handleReadChannelInbox(u)
 		return nil
 	})
+	// Los temas de un foro cambian sin mensajes: estos updates disparan un resync del foro.
+	dispatcher.OnChannel(func(ctx context.Context, e tg.Entities, u *tg.UpdateChannel) error {
+		p.handleChannelUpdate(u.ChannelID)
+		return nil
+	})
 
 	client := telegram.NewClient(p.apiID, p.apiHash, telegram.Options{
 		SessionStorage: &session.FileStorage{Path: p.sessionPath()},
-		UpdateHandler:  dispatcher,
+		UpdateHandler:  topicUpdateHandler{UpdateDispatcher: dispatcher, plugin: p},
 		Device: telegram.DeviceConfig{
 			DeviceModel:    "ConduitOmniChat",
 			SystemVersion:  "Linux",
@@ -158,6 +164,73 @@ func (p *TelegramPlugin) run(ctx context.Context) {
 			SentAtUnix:     time.Now().Unix(),
 		}
 	}
+}
+
+// topicUpdateHandler intercepta los updates de temas fijados antes de delegar en el
+// dispatcher normal. gotd v0.162.0 no genera los tipos UpdateChannelPinnedTopic(s),
+// así que se reconocen por el nombre del tipo generado y se leen por reflexión.
+type topicUpdateHandler struct {
+	tg.UpdateDispatcher
+	plugin *TelegramPlugin
+}
+
+// Handle revisa los updates internos y dispara el resync del foro afectado.
+func (h topicUpdateHandler) Handle(ctx context.Context, u tg.UpdatesClass) error {
+	if h.plugin != nil {
+		for _, inner := range innerUpdates(u) {
+			switch typeName(inner) {
+			case "UpdateChannelPinnedTopic", "UpdateChannelPinnedTopics":
+				if peer, ok := pinnedTopicPeer(inner); ok {
+					h.plugin.handlePinnedForumTopics(peer)
+				}
+			}
+		}
+	}
+	return h.UpdateDispatcher.Handle(ctx, u)
+}
+
+// innerUpdates aplana un contenedor de updates en sus updates internos.
+func innerUpdates(u tg.UpdatesClass) []tg.UpdateClass {
+	switch v := u.(type) {
+	case *tg.UpdateShort:
+		if v != nil && v.Update != nil {
+			return []tg.UpdateClass{v.Update}
+		}
+	case *tg.Updates:
+		if v != nil {
+			return v.Updates
+		}
+	case *tg.UpdatesCombined:
+		if v != nil {
+			return v.Updates
+		}
+	}
+	return nil
+}
+
+// typeName devuelve el nombre del tipo sin paquete ni puntero ("*tg.Foo" -> "Foo").
+func typeName(v any) string {
+	name := fmt.Sprintf("%T", v)
+	name = strings.TrimPrefix(name, "*")
+	if idx := strings.LastIndex(name, "."); idx >= 0 {
+		name = name[idx+1:]
+	}
+	return name
+}
+
+// pinnedTopicPeer extrae el peer de un update de temas fijados. Existe solo porque
+// gotd v0.162.0 no expone esos tipos: se leen por reflexión sin romper la compilación.
+func pinnedTopicPeer(u tg.UpdateClass) (tg.PeerClass, bool) {
+	value := reflect.ValueOf(u)
+	if !value.IsValid() || value.Kind() != reflect.Ptr || value.IsNil() {
+		return nil, false
+	}
+	field := value.Elem().FieldByName("Peer")
+	if !field.IsValid() || !field.CanInterface() {
+		return nil, false
+	}
+	peer, ok := field.Interface().(tg.PeerClass)
+	return peer, ok
 }
 
 // authenticate espera a que la cuenta esté autorizada y luego sincroniza.
@@ -193,6 +266,8 @@ func (p *TelegramPlugin) authenticate(ctx context.Context, client *telegram.Clie
 	})
 
 	p.syncDialogs(ctx, client)
+	// Resync continuo de temas: updates de foro (con debounce) y barrido periódico.
+	p.startTopicSync(ctx, client.API())
 
 	<-ctx.Done()
 	return nil

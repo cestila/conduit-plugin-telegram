@@ -65,6 +65,9 @@ func (p *TelegramPlugin) lookupPeer(remoteID string) *peerInfo {
 		return info
 	}
 	if chanRemoteID, topicID, isTopic := parseTopicRemoteID(remoteID); isTopic {
+		if _, deleted := p.deletedTopics[remoteID]; deleted {
+			return nil // un tema borrado no se sintetiza: ya no existe en el foro
+		}
 		var parent *peerInfo
 		if pChan, ok := p.peers[chanRemoteID]; ok {
 			parent = pChan
@@ -475,30 +478,6 @@ func (p *TelegramPlugin) applyChats(ctx context.Context, api dialogsAPI, chats [
 	}
 }
 
-// syncForumTopics consulta los temas de un supergrupo con foro en Telegram y los publica.
-// Devuelve error solo si la API falla; una lista vacía publica igualmente General.
-func (p *TelegramPlugin) syncForumTopics(ctx context.Context, api dialogsAPI, chat *tg.Channel) (int, error) {
-	if api == nil || chat == nil || !chat.Forum {
-		return 0, nil
-	}
-	serverRemoteID := channelRemoteID(chat.ID)
-	inputPeer := &tg.InputPeerChannel{ChannelID: chat.ID, AccessHash: chat.AccessHash}
-
-	res, err := api.MessagesGetForumTopics(ctx, &tg.MessagesGetForumTopicsRequest{
-		Peer:  inputPeer,
-		Limit: 100,
-	})
-	if err != nil {
-		log.Printf("⚠️ no se pudieron obtener los temas del foro %s: %v", chat.Title, err)
-		return 0, err
-	}
-	var topics []tg.ForumTopicClass
-	if res != nil {
-		topics = res.Topics
-	}
-	return p.applyForumTopics(serverRemoteID, chat.Title, inputPeer, topics), nil
-}
-
 // applyForumTopics publica los temas de un foro como canales hijos y recuerda sus peers.
 func (p *TelegramPlugin) applyForumTopics(serverRemoteID, serverTitle string, parentPeer tg.InputPeerClass, topics []tg.ForumTopicClass) int {
 	hasTopic1 := false
@@ -521,6 +500,10 @@ func (p *TelegramPlugin) applyForumTopics(serverRemoteID, serverTitle string, pa
 
 	count := 0
 	for _, tc := range topics {
+		if deleted, ok := tc.(*tg.ForumTopicDeleted); ok && deleted != nil {
+			p.markTopicDeleted(topicRemoteID(serverRemoteID, deleted.ID))
+			continue
+		}
 		topic, ok := tc.(*tg.ForumTopic)
 		if !ok || topic == nil {
 			continue
@@ -537,6 +520,7 @@ func (p *TelegramPlugin) applyForumTopics(serverRemoteID, serverTitle string, pa
 
 		remoteID := topicRemoteID(serverRemoteID, topic.ID)
 
+		p.clearTopicDeleted(remoteID)
 		p.rememberPeer(&peerInfo{
 			remoteID:    remoteID,
 			kind:        kindChannel,
@@ -640,6 +624,11 @@ func (p *TelegramPlugin) rememberEntities(e *tg.Entities) {
 
 // handleMessage convierte un mensaje MTProto en un evento para el core.
 func (p *TelegramPlugin) handleMessage(e *tg.Entities, m tg.MessageClass) {
+	if service, ok := m.(*tg.MessageService); ok && service != nil {
+		// Crear o editar un tema no llega como mensaje normal: dispara un resync del foro.
+		p.handleServiceMessage(service)
+		return
+	}
 	msg, ok := m.(*tg.Message)
 	if !ok || msg == nil {
 		return

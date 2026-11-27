@@ -1,6 +1,6 @@
 # conduit-plugin-telegram
 
-Telegram (MTProto user account) channel for Conduit, built on [gotd/td](https://github.com/gotd/td). Supports replies, reactions, polls, buttons, edit, delete, pin, read receipts, media, voice notes and forum topics (messages without a resolvable topic go to the forum's General topic).
+Telegram (MTProto user account) channel for Conduit, built on [gotd/td](https://github.com/gotd/td). Supports replies, reactions, polls, buttons, edit, delete, pin, read receipts, media, voice notes and forum topics (messages without a resolvable topic go to the forum's General topic; topic lists are re-synced on updates and every 5 minutes, and a complete list is published as `channel.reconcile` so the core can drop deleted topics).
 
 This is an official plugin for [ConduitOmniChat](https://github.com/cestila/ConduitOmniChat).
 It is a standalone executable that `conduitd` launches and talks to over gRPC
