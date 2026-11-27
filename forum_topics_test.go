@@ -49,7 +49,7 @@ func TestLookupPeerPlainChatUnaffected(t *testing.T) {
 	}
 }
 
-func TestMessageEventForumParentWithoutTopicStaysOnParent(t *testing.T) {
+func TestMessageEventForumWithoutTopicHeaderRoutesToGeneral(t *testing.T) {
 	p := NewTelegramPlugin()
 	p.rememberPeer(&peerInfo{
 		remoteID:    "-100555",
@@ -69,8 +69,56 @@ func TestMessageEventForumParentWithoutTopicStaysOnParent(t *testing.T) {
 	}
 
 	ev := p.messageEvent(msg, "-100555", kindChannel)
-	if ev == nil || ev.RemoteSenderId != "-100555" {
-		t.Fatalf("se esperaba RemoteSenderId=-100555, se obtuvo %q", ev.RemoteSenderId)
+	if ev == nil {
+		t.Fatal("se esperaba un evento de mensaje")
+	}
+	const general = "-100555_topic_1"
+	if ev.RemoteSenderId != general || ev.ChatJid != general {
+		t.Errorf("RemoteSenderId/ChatJid esperados %s, se obtuvo %q / %q", general, ev.RemoteSenderId, ev.ChatJid)
+	}
+	if ev.ChannelName != "General" {
+		t.Errorf("ChannelName esperado General, se obtuvo %q", ev.ChannelName)
+	}
+	if ev.ServerName != "Foro sin tema 1" || ev.ServerId != "-100555" || ev.ParentChannelId != "-100555" {
+		t.Errorf("jerarquía inválida: server=%q/%q parent=%q", ev.ServerId, ev.ServerName, ev.ParentChannelId)
+	}
+	if ev.ChannelType != "forum" {
+		t.Errorf("ChannelType esperado forum, se obtuvo %q", ev.ChannelType)
+	}
+	if !p.hasRegisteredPeer(general) {
+		t.Error("el tema General sintético debe quedar registrado")
+	}
+	if got := p.lookupPeer(general); got == nil || got.title != "General" {
+		t.Errorf("el peer General registrado debe titularse General, se obtuvo %+v", got)
+	}
+}
+
+func TestMessageEventForumUnregisteredTopicNeverNamedAfterGroup(t *testing.T) {
+	p := NewTelegramPlugin()
+	p.rememberPeer(&peerInfo{
+		remoteID:    "-100556",
+		kind:        kindChannel,
+		id:          556,
+		title:       "Nombre Grupo",
+		channelType: "forum",
+		peer:        &tg.InputPeerChannel{ChannelID: 556},
+	})
+
+	msg := &tg.Message{
+		ID:      301,
+		PeerID:  &tg.PeerChannel{ChannelID: 556},
+		FromID:  &tg.PeerUser{UserID: 888},
+		Date:    1_700_000_301,
+		Message: "En un tema aún no sincronizado",
+		ReplyTo: &tg.MessageReplyHeader{ForumTopic: true, ReplyToTopID: 9, ReplyToMsgID: 9},
+	}
+
+	ev := p.messageEvent(msg, "-100556", kindChannel)
+	if ev == nil || ev.RemoteSenderId != "-100556_topic_9" {
+		t.Fatalf("se esperaba enrutar al tema 9, se obtuvo %+v", ev)
+	}
+	if ev.ChannelName == "Nombre Grupo" || ev.ChannelName != "Tema 9" {
+		t.Errorf("el tema no registrado no debe llamarse como el grupo, ChannelName=%q", ev.ChannelName)
 	}
 }
 

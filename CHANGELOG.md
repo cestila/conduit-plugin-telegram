@@ -9,6 +9,12 @@ Every pull request with a user-visible change adds an entry under
 
 ## [Unreleased]
 
+### Fixed
+
+- Forum supergroups: a message whose topic cannot be resolved is routed to the General topic (`_topic_1`) instead of a channel named after the group, and unregistered topics are no longer named after the group.
+- The forum parent is no longer published as a `channel.sync` named after the group when topic sync fails or returns nothing; an empty topic list still publishes General.
+- `messages.getDialogs` is now paginated (offset date/id/peer, capped at 50 pages), so forums beyond the first 100 dialogs get their topics.
+
 ## [0.1.4] - 2026-11-19
 
 ### Added
